@@ -205,13 +205,14 @@ async def check_in_with_browser(
 		await page.goto(login_url, wait_until='domcontentloaded')
 		await wait_for_waf_ready(page)
 
-		# 注入用户提供的 cookies（session 等）
+		# 注入用户提供的 cookies（只注入登录态 session，WAF cookies 由浏览器自行计算）
 		if user_cookies:
 			host = _extract_host(provider_config.domain)
+			waf_names = set(provider_config.waf_cookie_names or [])
 			cookie_list = [
 				{'name': name, 'value': value, 'domain': host, 'path': '/'}
 				for name, value in user_cookies.items()
-				if name and value
+				if name and value and name not in waf_names
 			]
 			try:
 				await page.context.add_cookies(cookie_list)
