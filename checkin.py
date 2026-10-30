@@ -249,7 +249,6 @@ async def check_in_with_browser(
 			r = await browser_fetch(user_info_url)
 			if r and r.get('status') == 200:
 				user_info_before = _to_user_info(json.loads(r.get('body') or '') if r.get('body') else None)
-			print(f'[DEBUG] {account_name}: user_info status={r.get("status") if r else None} body={(r.get("body") or "")[:200]!r}')
 		except Exception:  # nosec B110
 			pass
 		if user_info_before:
@@ -265,8 +264,6 @@ async def check_in_with_browser(
 
 		parsed = _parse_api_response(status, text)
 		success = parsed.get('ok', False)
-		raw_hint = (text or '').replace('\n', ' ')[:300]
-		print(f'[DEBUG] {account_name}: check-in resp body={raw_hint!r}')
 
 		# 签到后余额
 		user_info_after = None
