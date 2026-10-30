@@ -234,6 +234,58 @@ async def login_with_credentials(
 		return None
 
 
+def login_http(account_name: str, provider_config, email: str, password: str):
+	"""直接调 /api/user/login 登录(适配 new-api v1.0 rc 系)。
+
+	返回 (bearer_token, api_user, cookies):
+	- rc 系: 登录返回 access_token(JWT) 与 user.id, 走 Bearer 认证
+	- 旧版: 返回 session cookies, 走 cookie 认证
+	失败返回 (None, None, None)。
+	"""
+	print(f'[PROCESSING] {account_name}: Logging in via HTTP API...')
+	domain = provider_config.domain
+	headers = {
+		'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+		'Accept': 'application/json, text/plain, */*',
+		'Content-Type': 'application/json',
+		'Referer': f'{domain}/login',
+		'Origin': domain,
+	}
+	try:
+		with httpx.Client(http2=True, timeout=30.0) as client:
+			response = client.post(
+				f'{domain}/api/user/login',
+				headers=headers,
+				json={'username': email, 'password': password},
+			)
+			data = response.json()
+			if response.status_code != 200 or not data.get('success'):
+				msg = data.get('message', f'HTTP {response.status_code}')
+				print(f'[FAILED] {account_name}: HTTP login failed - {msg}')
+				return None, None, None
+
+			payload = data.get('data') or {}
+			user = payload.get('user') if isinstance(payload.get('user'), dict) else payload
+			uid = str(user['id']) if user.get('id') is not None else None
+			token = payload.get('access_token')
+
+			if token:
+				print(f'[SUCCESS] {account_name}: HTTP login successful, got access_token (Bearer auth)')
+				return token, uid, None
+
+			# 旧版: 无 access_token, 使用 session cookies
+			cookies = {c.name: c.value for c in client.cookies.jar if c.name and c.value}
+			if cookies:
+				print(f'[SUCCESS] {account_name}: HTTP login successful, got {len(cookies)} cookies')
+				return None, uid, cookies
+
+			print(f'[FAILED] {account_name}: HTTP login succeeded but no access_token/cookies returned')
+			return None, None, None
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Error during HTTP login: {str(e)[:80]}')
+		return None, None, None
+
+
 def get_user_info(client, headers, user_info_url: str):
 	"""获取用户信息"""
 	try:
@@ -275,6 +327,51 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 		print(f'[INFO] {account_name}: Bypass WAF not required, using user cookies directly')
 
 	return {**waf_cookies, **user_cookies}
+
+
+def execute_xingya_check_in(client, account_name: str, provider_config, headers: dict):
+	"""星芽(xingya)专属签到流程。
+
+	1. POST /api/user/xingya-checkin/key  领取/复用签到密钥
+	2. POST /api/user/xingya-daily-claim  领取每日签到奖励
+	"""
+	print(f'[NETWORK] {account_name}: Executing xingya check-in flow')
+
+	checkin_headers = headers.copy()
+	checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
+
+	# 1. 确保签到密钥存在(已存在则 reused=true)
+	try:
+		r = client.post(f'{provider_config.domain}/api/user/xingya-checkin/key', headers=checkin_headers, timeout=30)
+		if r.status_code != 200:
+			print(f'[FAILED] {account_name}: xingya key request - HTTP {r.status_code}')
+			return False
+		key_data = r.json().get('data') or {}
+		print(f'[INFO] {account_name}: check-in key ready (reused={key_data.get("reused")})')
+	except Exception as e:
+		print(f'[FAILED] {account_name}: xingya key error - {str(e)[:60]}')
+		return False
+
+	# 2. 领取每日奖励
+	try:
+		r = client.post(f'{provider_config.domain}/api/user/xingya-daily-claim', headers=checkin_headers, timeout=30)
+		print(f'[RESPONSE] {account_name}: Response status code {r.status_code}')
+		if r.status_code != 200:
+			print(f'[FAILED] {account_name}: xingya daily-claim - HTTP {r.status_code}')
+			return False
+		result = r.json()
+		data = result.get('data') or {}
+		if data.get('already_claimed'):
+			print(f'[SUCCESS] {account_name}: Already checked in today')
+			return True
+		if result.get('success') or data.get('quota_awarded') is not None:
+			print(f'[SUCCESS] {account_name}: Check-in successful!')
+			return True
+		print(f'[FAILED] {account_name}: Check-in failed - {result.get("message", "Unknown error")}')
+		return False
+	except Exception as e:
+		print(f'[FAILED] {account_name}: xingya daily-claim error - {str(e)[:60]}')
+		return False
 
 
 def execute_check_in(client, account_name: str, provider_config, headers: dict):
@@ -366,23 +463,48 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	all_cookies = None
 	resolved_api_user: str | None = None
 	auth_method = None
+	bearer_token: str | None = None
 	if account.has_login_credentials():
-		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
-		assert account.email is not None and account.password is not None
-		login_result = await login_with_credentials(
-			account_name,
-			provider_config,
-			account.provider,
-			account.email,
-			account.password,
-		)
-		if login_result:
-			all_cookies = login_result.cookies
-			resolved_api_user = login_result.api_user
-			auth_method = 'email/password'
+		if provider_config.login_method == 'http':
+			print(f'[INFO] {account_name}: Attempting HTTP login (login_method=http)...')
+			bearer_token, resolved_api_user, http_cookies = login_http(
+				account_name,
+				provider_config,
+				account.email,
+				account.password,
+			)
+			if http_cookies and not bearer_token:
+				all_cookies = await prepare_cookies(account_name, provider_config, http_cookies)
+				auth_method = 'http login (session cookies)'
+			elif bearer_token:
+				all_cookies = {}
+				auth_method = 'http login (Bearer JWT)'
+			else:
+				return False, None, None
 		else:
-			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
-			return False, None, None
+			print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
+			assert account.email is not None and account.password is not None
+			login_result = await login_with_credentials(
+				account_name,
+				provider_config,
+				account.provider,
+				account.email,
+				account.password,
+			)
+			if login_result:
+				all_cookies = login_result.cookies
+				resolved_api_user = login_result.api_user
+				auth_method = 'email/password'
+			else:
+				print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
+				return False, None, None
+	elif account.has_access_token():
+		print(f'[INFO] {account_name}: Using system access token (Bearer auth)')
+		user_cookies = parse_cookies(account.cookies) if account.cookies else {}
+		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
+		resolved_api_user = account.api_user
+		bearer_token = account.access_token
+		auth_method = 'access token'
 	else:
 		user_cookies = parse_cookies(account.cookies)
 		if not user_cookies:
@@ -391,18 +513,19 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		auth_method = 'session cookies'
 
-	if not all_cookies:
+	if not all_cookies and not bearer_token:
 		return False, None, None
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
 
 	return run_check_in_requests(
-		all_cookies,
+		all_cookies or {},
 		account,
 		account_name,
 		provider_config,
 		api_user_override=resolved_api_user,
 		use_proxy=provider_config.use_proxy,
+		auth_bearer=bearer_token,
 	)
 
 
@@ -414,6 +537,7 @@ def run_check_in_requests(
 	*,
 	api_user_override: str | None = None,
 	use_proxy: bool = False,
+	auth_bearer: str | None = None,
 ) -> tuple[bool, dict | None, dict | None]:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
 	try:
@@ -448,6 +572,10 @@ def run_check_in_requests(
 			if api_user:
 				headers[provider_config.api_user_key] = api_user
 
+			bearer = auth_bearer or account.access_token
+			if bearer:
+				headers['Authorization'] = f'Bearer {bearer}'
+
 			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
 			user_info_before = get_user_info(client, headers, user_info_url)
 			if user_info_before and user_info_before.get('success'):
@@ -456,7 +584,10 @@ def run_check_in_requests(
 				print(user_info_before.get('error', 'Unknown error'))
 
 			if provider_config.needs_manual_check_in():
-				success = execute_check_in(client, account_name, provider_config, headers)
+				if provider_config.checkin_flow == 'xingya':
+					success = execute_xingya_check_in(client, account_name, provider_config, headers)
+				else:
+					success = execute_check_in(client, account_name, provider_config, headers)
 				user_info_after = get_user_info(client, headers, user_info_url)
 				return success, user_info_before, user_info_after
 

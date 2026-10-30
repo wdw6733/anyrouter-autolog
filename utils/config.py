@@ -23,6 +23,11 @@ class ProviderConfig:
 	waf_cookie_names: List[str] | None = None
 	use_proxy: bool = False
 	persist_profile: bool = False
+	# 登录方式: browser=浏览器自动化(默认); http=直接调 /api/user/login 换 JWT
+	# (适配 new-api v1.0 rc 系: 登录返回 access_token, API 只认 Bearer)
+	login_method: str = 'browser'
+	# 签到流程: None=标准 POST sign_in_path; 'xingya'=星芽两步签到(key+daily-claim)
+	checkin_flow: str | None = None
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -61,6 +66,8 @@ class ProviderConfig:
 			waf_cookie_names=data.get('waf_cookie_names', defaults.waf_cookie_names if defaults else None),
 			use_proxy=data.get('use_proxy', default_use_proxy),
 			persist_profile=data.get('persist_profile', default_persist_profile),
+			login_method=data.get('login_method', defaults.login_method if defaults else 'browser'),
+			checkin_flow=data.get('checkin_flow', defaults.checkin_flow if defaults else None),
 		)
 
 	def needs_waf_cookies(self) -> bool:
@@ -155,6 +162,8 @@ class AccountConfig:
 	name: str | None = None
 	email: str | None = None
 	password: str | None = None
+	# 系统访问令牌(个人设置里生成长期 token), 请求时走 Authorization: Bearer
+	access_token: str | None = None
 
 	@classmethod
 	def from_dict(cls, data: dict, index: int) -> 'AccountConfig':
@@ -169,11 +178,16 @@ class AccountConfig:
 			name=name if name else None,
 			email=data.get('email'),
 			password=data.get('password'),
+			access_token=data.get('access_token'),
 		)
 
 	def has_login_credentials(self) -> bool:
 		"""是否配置了邮箱密码登录"""
 		return bool(self.email and self.password)
+
+	def has_access_token(self) -> bool:
+		"""是否配置了系统访问令牌"""
+		return bool(self.access_token)
 
 	def get_display_name(self, index: int) -> str:
 		"""获取显示名称"""
@@ -205,19 +219,21 @@ def load_accounts_config() -> list[AccountConfig] | None:
 				print(f'ERROR: Account {i + 1} configuration format is incorrect')
 				return None
 
+			has_access_token = bool(account_dict.get('access_token'))
 			if 'api_user' not in account_dict:
 				has_login = account_dict.get('email') and account_dict.get('password')
-				if not has_login:
+				if not has_login and not has_access_token:
 					print(
-						f'ERROR: Account {i + 1} missing required field (api_user) - only email+password login can omit it'
+						f'ERROR: Account {i + 1} missing required field (api_user) - '
+						'only email+password or access_token login can omit it'
 					)
 					return None
 
 			has_cookies = 'cookies' in account_dict and account_dict['cookies']
 			has_login = account_dict.get('email') and account_dict.get('password')
 
-			if not has_cookies and not has_login:
-				print(f'ERROR: Account {i + 1} must have either cookies or email+password')
+			if not has_cookies and not has_login and not has_access_token:
+				print(f'ERROR: Account {i + 1} must have cookies, email+password or access_token')
 				return None
 
 			if 'name' in account_dict and not account_dict['name']:
