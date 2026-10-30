@@ -139,6 +139,160 @@ async def get_waf_cookies_with_browser(
 		return None
 
 
+def _extract_host(domain: str) -> str:
+	"""从 provider domain 提取 hostname，用于 cookie 注入"""
+	from urllib.parse import urlparse
+
+	return urlparse(domain).hostname or domain
+
+
+def _parse_api_response(status: int, text: str) -> dict:
+	"""解析签到/用户信息接口响应，返回 {ok, reason?, already?, payload?}"""
+	if status != 200:
+		return {'ok': False, 'reason': f'HTTP {status}'}
+	try:
+		payload = json.loads(text) if text else None
+	except Exception:  # nosec B110
+		payload = None
+	if payload is None:
+		return {'ok': False, 'reason': 'Invalid response format', 'raw': (text or '')[:200]}
+	if payload.get('success') or payload.get('ret') == 1 or payload.get('code') == 0:
+		return {'ok': True, 'payload': payload}
+	msg = str(payload.get('msg') or payload.get('message') or 'Unknown error')
+	already_keywords = ['已经签到', '已签到', '重复签到', 'already checked', 'already signed']
+	if any(keyword in msg.lower() for keyword in already_keywords):
+		return {'ok': True, 'already': True, 'payload': payload}
+	return {'ok': False, 'reason': msg, 'payload': payload}
+
+
+def _to_user_info(payload: object) -> dict | None:
+	"""把 /api/user/self 的 payload 转成余额信息 dict"""
+	if not isinstance(payload, dict):
+		return None
+	data = payload.get('data') if isinstance(payload.get('data'), dict) else None
+	if not payload.get('success') or not data:
+		return None
+	quota = round(float(data.get('quota', 0)) / 500000, 2)
+	used = round(float(data.get('used_quota', 0)) / 500000, 2)
+	return {'success': True, 'quota': quota, 'used_quota': used, 'display': f':money: Current balance: ${quota}, Used: ${used}'}
+
+
+async def check_in_with_browser(
+	account,
+	account_name: str,
+	provider_config,
+	user_cookies: dict,
+) -> tuple[bool, dict | None, dict | None]:
+	"""用浏览器（CloakBrowser）在页面上下文里发签到请求。
+
+	阿里云/Cloudflare WAF 会校验 TLS 指纹（JA3），httpx 过不去，
+	必须在真实浏览器里发请求才能复用 WAF 放行后的会话。
+	"""
+	print(f'[PROCESSING] {account_name}: Starting browser for WAF check-in...')
+
+	launch_kwargs: dict = {'headless': True}
+	proxy = get_playwright_proxy(use_proxy=provider_config.use_proxy)
+	if proxy:
+		launch_kwargs['proxy'] = proxy
+	browser = await launch_async(**launch_kwargs)
+
+	try:
+		page = await browser.new_page()
+		await prepare_browser_page(page)
+
+		login_url = f'{provider_config.domain}{provider_config.login_path}'
+		print(f'[PROCESSING] {account_name}: Accessing login page to get WAF cookies...')
+		await page.goto(login_url, wait_until='domcontentloaded')
+		await wait_for_waf_ready(page)
+
+		# 注入用户提供的 cookies（session 等）
+		if user_cookies:
+			host = _extract_host(provider_config.domain)
+			cookie_list = [
+				{'name': name, 'value': value, 'domain': host, 'path': '/'}
+				for name, value in user_cookies.items()
+				if name and value
+			]
+			try:
+				await page.context.add_cookies(cookie_list)
+				print(f'[INFO] {account_name}: Injected {len(cookie_list)} session cookie(s)')
+			except Exception as e:  # nosec B110
+				print(f'[WARN] {account_name}: Failed to inject cookies: {str(e)[:80]}')
+
+		api_user = account.api_user
+		new_api_user_header = f"'new-api-user': '{api_user}'," if api_user else ''
+
+		async def browser_fetch(url: str, method: str = 'GET') -> dict:
+			js = f"""
+			(async () => {{
+				const resp = await fetch('{url}', {{
+					method: '{method}',
+					headers: {{
+						'Content-Type': 'application/json',
+						'X-Requested-With': 'XMLHttpRequest',
+						{new_api_user_header}
+					}},
+					credentials: 'include'
+				}});
+				const text = await resp.text();
+				return {{status: resp.status, body: text}};
+			}})()
+			"""
+			return await page.evaluate(js)
+
+		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+
+		# 签到前余额
+		user_info_before = None
+		try:
+			r = await browser_fetch(user_info_url)
+			if r and r.get('status') == 200:
+				user_info_before = _to_user_info(json.loads(r.get('body') or '') if r.get('body') else None)
+		except Exception:  # nosec B110
+			pass
+		if user_info_before:
+			print(user_info_before['display'])
+
+		# 签到
+		sign_in_url = f'{provider_config.domain}{provider_config.sign_in_path}'
+		print(f'[NETWORK] {account_name}: Executing check-in via browser')
+		r = await browser_fetch(sign_in_url, method='POST')
+		status = r.get('status') if r else 0
+		text = r.get('body') if r else ''
+		print(f'[RESPONSE] {account_name}: Response status code {status}')
+
+		parsed = _parse_api_response(status, text)
+		success = parsed.get('ok', False)
+
+		# 签到后余额
+		user_info_after = None
+		try:
+			r2 = await browser_fetch(user_info_url)
+			if r2 and r2.get('status') == 200:
+				user_info_after = _to_user_info(json.loads(r2.get('body') or '') if r2.get('body') else None)
+		except Exception:  # nosec B110
+			pass
+
+		if success:
+			if parsed.get('already'):
+				print(f'[SUCCESS] {account_name}: Already checked in today')
+			else:
+				print(f'[SUCCESS] {account_name}: Check-in successful!')
+		else:
+			print(f'[FAILED] {account_name}: Check-in failed - {parsed.get("reason", "Unknown error")}')
+
+		await browser.close()
+		return success, user_info_before, user_info_after
+
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Error during browser check-in - {str(e)[:80]}')
+		try:
+			await browser.close()
+		except Exception:  # nosec B110
+			pass
+		return False, None, None
+
+
 async def login_with_credentials(
 	account_name: str,
 	provider_config,
@@ -510,6 +664,9 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		if not user_cookies:
 			print(f'[FAILED] {account_name}: Invalid configuration format')
 			return False, None, None
+		if provider_config.needs_waf_cookies():
+			# WAF 站点：httpx 过不了 TLS 指纹检测，改走浏览器上下文签到
+			return await check_in_with_browser(account, account_name, provider_config, user_cookies)
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		auth_method = 'session cookies'
 
