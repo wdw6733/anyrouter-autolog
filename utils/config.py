@@ -28,6 +28,8 @@ class ProviderConfig:
 	login_method: str = 'browser'
 	# 签到流程: None=标准 POST sign_in_path; 'xingya'=星芽两步签到(key+daily-claim)
 	checkin_flow: str | None = None
+	# 签到方式: None=HTTP(默认); 'browser'=浏览器上下文签到(绕过 TLS 指纹/会话校验)
+	checkin_mode: str | None = None
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -68,6 +70,7 @@ class ProviderConfig:
 			persist_profile=data.get('persist_profile', default_persist_profile),
 			login_method=data.get('login_method', defaults.login_method if defaults else 'browser'),
 			checkin_flow=data.get('checkin_flow', defaults.checkin_flow if defaults else None),
+			checkin_mode=data.get('checkin_mode', defaults.checkin_mode if defaults else None),
 		)
 
 	def needs_waf_cookies(self) -> bool:
