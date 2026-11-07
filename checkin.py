@@ -182,6 +182,7 @@ async def check_in_with_browser(
 	account_name: str,
 	provider_config,
 	user_cookies: dict,
+	bearer_token: str | None = None,
 ) -> tuple[bool, dict | None, dict | None]:
 	"""用浏览器（CloakBrowser）在页面上下文里发签到请求。
 
@@ -222,6 +223,7 @@ async def check_in_with_browser(
 
 		api_user = account.api_user
 		new_api_user_header = f"'new-api-user': '{api_user}'," if api_user else ''
+		auth_header = f"'Authorization': 'Bearer {bearer_token}'," if bearer_token else ''
 
 		async def browser_fetch(url: str, method: str = 'GET') -> dict:
 			js = f"""
@@ -229,10 +231,11 @@ async def check_in_with_browser(
 				const resp = await fetch('{url}', {{
 					method: '{method}',
 					headers: {{
-						'Content-Type': 'application/json',
-						'X-Requested-With': 'XMLHttpRequest',
-						{new_api_user_header}
-					}},
+					'Content-Type': 'application/json',
+					'X-Requested-With': 'XMLHttpRequest',
+					{new_api_user_header}
+					{auth_header}
+				}},
 					credentials: 'include'
 				}});
 				const text = await resp.text();
@@ -656,6 +659,9 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	elif account.has_access_token():
 		print(f'[INFO] {account_name}: Using system access token (Bearer auth)')
 		user_cookies = parse_cookies(account.cookies) if account.cookies else {}
+		if provider_config.checkin_mode == 'browser':
+			# 站点要求"先打开网站再签到"(TLS 指纹/会话校验)，改走浏览器上下文签到
+			return await check_in_with_browser(account, account_name, provider_config, user_cookies, bearer_token=account.access_token)
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		resolved_api_user = account.api_user
 		bearer_token = account.access_token
