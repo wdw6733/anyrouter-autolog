@@ -570,6 +570,95 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 		return False
 
 
+def execute_string_captcha_check_in(client, account_name: str, provider_config, headers: dict):
+	"""string_captcha 图形验证码签到（SheApi 等站）。
+
+	1. GET /api/captcha?scene=checkin 取图（返回 captcha_id + base64 图片）
+	2. ddddocr 离线识别
+	3. POST /api/user/checkin 带 {captcha_id, captcha_code}
+	验证码识别错误时换一张重试（captcha_id 单次有效）。
+	"""
+	print(f'[NETWORK] {account_name}: Executing string_captcha check-in')
+
+	import base64
+
+	try:
+		import ddddocr
+	except ImportError:  # nosec B110
+		print(f'[FAILED] {account_name}: ddddocr 未安装，无法识别图形验证码')
+		return False
+
+	ocr = ddddocr.DdddOcr(show_ad=False)
+	checkin_headers = headers.copy()
+	checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
+
+	for attempt in range(1, 5):
+		# 1. 取图
+		try:
+			r = client.get(
+				f'{provider_config.domain}/api/captcha',
+				params={'scene': 'checkin'},
+				headers=headers,
+				timeout=30,
+			)
+		except Exception as e:  # nosec B110
+			print(f'[FAILED] {account_name}: 获取验证码异常 - {str(e)[:60]}')
+			return False
+		if r.status_code != 200:
+			print(f'[FAILED] {account_name}: 获取验证码失败 - HTTP {r.status_code}')
+			return False
+		try:
+			data = r.json().get('data') or {}
+		except Exception:  # nosec B110
+			data = {}
+		captcha_id = str(data.get('captcha_id') or '')
+		image = str(data.get('image') or '')
+		if not captcha_id or not image:
+			print(f'[FAILED] {account_name}: 验证码接口返回结构异常')
+			return False
+
+		# 2. 识别
+		img_b64 = image.split(',', 1)[1] if ',' in image else image
+		try:
+			raw = base64.b64decode(img_b64)
+			answer = ocr.classification(raw)
+		except Exception as e:  # nosec B110
+			print(f'[FAILED] {account_name}: 验证码识别异常 - {str(e)[:60]}')
+			return False
+		print(f'[INFO] {account_name}: 第 {attempt} 次验证码识别为 {answer!r}')
+		if not answer:
+			continue
+
+		# 3. 签到
+		r2 = client.post(
+			f'{provider_config.domain}{provider_config.sign_in_path}',
+			json={'captcha_id': captcha_id, 'captcha_code': answer},
+			headers=checkin_headers,
+			timeout=30,
+		)
+		print(f'[RESPONSE] {account_name}: Response status code {r2.status_code}')
+		if r2.status_code != 200:
+			print(f'[FAILED] {account_name}: Check-in failed - HTTP {r2.status_code}')
+			return False
+		try:
+			result = r2.json()
+		except Exception:  # nosec B110
+			print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
+			return False
+		msg = str(result.get('message') or '')
+		if result.get('success') or any(k in msg for k in ['已签到', '已经签到', '重复签到', 'already']):
+			print(f'[SUCCESS] {account_name}: Check-in successful! (验证码 {answer})')
+			return True
+		if any(k in msg.lower() for k in ['验证码错误', '验证码不正确', '验证码已失效', '验证码失效', 'captcha']):
+			print(f'[WARN] {account_name}: 验证码 {answer} 错误，换一张重试 ({attempt}/4)')
+			continue
+		print(f'[FAILED] {account_name}: Check-in failed - {msg}')
+		return False
+
+	print(f'[FAILED] {account_name}: 验证码连续 4 次识别失败')
+	return False
+
+
 def format_check_in_notification(detail: dict) -> str:
 	"""格式化签到通知消息"""
 	lines = [
@@ -750,6 +839,8 @@ def run_check_in_requests(
 			if provider_config.needs_manual_check_in():
 				if provider_config.checkin_flow == 'xingya':
 					success = execute_xingya_check_in(client, account_name, provider_config, headers)
+				elif provider_config.checkin_flow == 'string_captcha':
+					success = execute_string_captcha_check_in(client, account_name, provider_config, headers)
 				else:
 					success = execute_check_in(client, account_name, provider_config, headers)
 				user_info_after = get_user_info(client, headers, user_info_url)
